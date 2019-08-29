@@ -2,7 +2,9 @@ package bigtable
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -60,6 +62,7 @@ type BigtableIdx struct {
 	memory.MemoryIndex
 	cfg        *IdxConfig
 	tbl        *bigtable.Table
+	mrTbl      *bigtable.Table // meta record table
 	client     *bigtable.Client
 	writeQueue chan writeReq
 	shutdown   chan struct{}
@@ -211,6 +214,7 @@ func (b *BigtableIdx) InitBare() error {
 			}
 		}
 	}
+
 	client, err := bigtable.NewClient(ctx, b.cfg.GcpProject, b.cfg.BigtableInstance)
 	if err != nil {
 		log.Errorf("bigtable-idx: failed to create bigtable client: %s", err)
@@ -219,6 +223,11 @@ func (b *BigtableIdx) InitBare() error {
 
 	b.client = client
 	b.tbl = client.Open(b.cfg.TableName)
+
+	if memory.MetaTagSupport {
+		b.mrTbl = client.Open(b.cfg.MetaRecordTableName)
+	}
+
 	return nil
 }
 
@@ -409,12 +418,82 @@ func (b *BigtableIdx) MetaTagRecordUpsert(orgId uint32, upsertRecord tagquery.Me
 	return record, created, nil
 }
 
+func formatMetaRecordRowKey(orgId uint32, record tagquery.MetaTagRecord) (string, error) {
+	expressions, err := record.Expressions.MarshalJSON()
+	if err != nil {
+		return "", fmt.Errorf("Failed to marshal expressions: %s", err)
+	}
+
+	return strconv.Itoa(int(orgId)) + "_" + string(expressions), nil
+}
+
 func (b *BigtableIdx) persistMetaRecord(orgId uint32, record tagquery.MetaTagRecord, created bool) error {
-	return nil
+	var write func() error
+	key, err := formatMetaRecordRowKey(orgId, record)
+	if err != nil {
+		return fmt.Errorf("Failed to generate row key: %s", err)
+	}
+
+	metaTags, err := record.MetaTags.MarshalJSON()
+	if err != nil {
+		return fmt.Errorf("Failed to marshal meta tags: %s", err)
+	}
+
+	mut := bigtable.NewMutation()
+	mut.Set(META_RECORD_COLUMN_FAMILY, "metatags", bigtable.Now(), metaTags)
+	if created {
+		write = func() error {
+			now := make([]byte, binary.MaxVarintLen64)
+			binary.PutVarint(now, time.Now().UnixNano())
+			mut.Set(META_RECORD_COLUMN_FAMILY, "lastupdate", bigtable.Now(), now)
+			mut.Set(META_RECORD_COLUMN_FAMILY, "createdat", bigtable.Now(), now)
+
+			return b.mrTbl.Apply(context.Background(), key, mut)
+		}
+	} else {
+		write = func() error {
+			now := make([]byte, binary.MaxVarintLen64)
+			binary.PutVarint(now, time.Now().UnixNano())
+			mut.Set(META_RECORD_COLUMN_FAMILY, "lastupdate", bigtable.Now(), now)
+
+			return b.mrTbl.Apply(context.Background(), key, mut)
+		}
+	}
+
+	return b.flushMetaRecordUpdate(write)
 }
 
 func (b *BigtableIdx) deleteMetaRecord(orgId uint32, record tagquery.MetaTagRecord) error {
-	return nil
+	key, err := formatMetaRecordRowKey(orgId, record)
+	if err != nil {
+		return fmt.Errorf("Failed to generate row key: %s", err)
+	}
+
+	mut := bigtable.NewMutation()
+	mut.DeleteRow()
+
+	return b.flushMetaRecordUpdate(func() error {
+		return b.mrTbl.Apply(context.Background(), key, mut)
+	})
+}
+
+func (b *BigtableIdx) flushMetaRecordUpdate(flush func() error) error {
+	var err error
+	var attempts uint8
+	for {
+		err = flush()
+		if err == nil {
+			return nil
+		}
+
+		attempts++
+
+		if attempts >= 3 {
+			return err
+		}
+
+		time.Sleep(time.Duration(attempts*100) * time.Millisecond)
+	}
 }
 
 func (b *BigtableIdx) LoadPartition(partition int32, defs []schema.MetricDefinition, now time.Time) []schema.MetricDefinition {
