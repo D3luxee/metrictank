@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -388,7 +389,64 @@ func (b *BigtableIdx) rebuildIndex() {
 		num += b.MemoryIndex.LoadPartition(partition, defs)
 	}
 
+	if memory.MetaTagSupport {
+		b.loadMetaRecords()
+
+	}
+
 	log.Infof("bigtable-idx: Rebuilding Memory Index Complete. Imported %d. Took %s", num, time.Since(pre))
+}
+
+func (b *BigtableIdx) loadMetaRecords() map[uint32][]tagquery.MetaTagRecord {
+	rowRange := bigtable.RowRange{}
+	ctx := context.Background()
+	metaTagsColumnId := META_RECORD_COLUMN_FAMILY + ":metatags"
+	b.mrTbl.ReadRows(ctx, rowRange, func(row bigtable.Row) bool {
+		var metaTags tagquery.Tags
+
+		columns, ok := row[META_RECORD_COLUMN_FAMILY]
+		if !ok {
+			log.Errorf("No columns in columnFamily %s", META_RECORD_COLUMN_FAMILY)
+			return false
+		}
+
+		orgId, expressions, err := decodeMetaRecordRowKey(row.Key())
+		if err != nil {
+			log.Errorf("Failed to decode row key (%q): %s", row.Key(), err)
+		}
+
+		var foundMetaTags bool
+		for _, col := range columns {
+			if col.Column == metaTagsColumnId {
+				err = metaTags.UnmarshalJSON(col.Value)
+				if err != nil {
+					log.Errorf("Failed to unmarshal metaTags value obtained from bigtable (%q): %s", string(col.Value), err)
+					return false
+				}
+				foundMetaTags = true
+				break
+			}
+		}
+
+		if !foundMetaTags {
+			log.Errorf("Received invalid meta record row missing meta tags")
+			return false
+		}
+
+		record := tagquery.MetaTagRecord{
+			Expressions: expressions,
+			MetaTags:    metaTags,
+		}
+
+		_, _, err = b.MemoryIndex.MetaTagRecordUpsert(orgId, record)
+		if err != nil {
+			log.Errorf("Failed to upsert meta record loaded from bigtable: %s", err)
+			return false
+		}
+
+		return true
+	})
+	return nil
 }
 
 func (b *BigtableIdx) MetaTagRecordUpsert(orgId uint32, upsertRecord tagquery.MetaTagRecord) (tagquery.MetaTagRecord, bool, error) {
@@ -425,6 +483,27 @@ func formatMetaRecordRowKey(orgId uint32, record tagquery.MetaTagRecord) (string
 	}
 
 	return strconv.Itoa(int(orgId)) + "_" + string(expressions), nil
+}
+
+func decodeMetaRecordRowKey(raw string) (uint32, tagquery.Expressions, error) {
+	var expressions tagquery.Expressions
+	var orgId uint32
+	splits := strings.SplitN(raw, "_", 2)
+	if len(splits) < 2 {
+		return orgId, expressions, fmt.Errorf("Invalid key: %s", raw)
+	}
+
+	var err error
+	var orgIdInt int
+	orgIdInt, err = strconv.Atoi(splits[0])
+	if err != nil {
+		return orgId, expressions, fmt.Errorf("Cannot convert org id string into number: %d", orgId)
+	}
+
+	orgId = uint32(orgIdInt)
+
+	err = expressions.UnmarshalJSON([]byte(splits[1]))
+	return orgId, expressions, err
 }
 
 func (b *BigtableIdx) persistMetaRecord(orgId uint32, record tagquery.MetaTagRecord, created bool) error {
