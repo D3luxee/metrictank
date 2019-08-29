@@ -8,6 +8,7 @@ import (
 
 	"cloud.google.com/go/bigtable"
 	"github.com/grafana/metrictank/cluster"
+	"github.com/grafana/metrictank/expr/tagquery"
 	"github.com/grafana/metrictank/idx"
 	"github.com/grafana/metrictank/idx/memory"
 	"github.com/grafana/metrictank/schema"
@@ -17,6 +18,7 @@ import (
 )
 
 const COLUMN_FAMILY = "idx"
+const META_RECORD_COLUMN_FAMILY = "mr"
 
 var (
 	// metric idx.bigtable.query-insert.ok is how many insert queries for a metric completed successfully (triggered by an add or an update)
@@ -147,6 +149,64 @@ func (b *BigtableIdx) InitBare() error {
 				if err != nil {
 					log.Errorf("bigtable-idx: failed to set GCPolicy of %s/%s: %s", b.cfg.TableName, COLUMN_FAMILY, err)
 					return err
+				}
+			}
+		}
+
+		if memory.MetaTagSupport {
+			found := false
+			for _, t := range tables {
+				if t == b.cfg.MetaRecordTableName {
+					found = true
+					break
+				}
+			}
+
+			if !found {
+				log.Infof("bigtable-idx: table %q does not yet exist. Creating it.", b.cfg.MetaRecordTableName)
+				table := bigtable.TableConf{
+					TableID: b.cfg.MetaRecordTableName,
+					Families: map[string]bigtable.GCPolicy{
+						META_RECORD_COLUMN_FAMILY: bigtable.MaxVersionsPolicy(1),
+					},
+				}
+				err := adminClient.CreateTableFromConf(ctx, &table)
+				if err != nil {
+					log.Errorf("bigtable-idx: failed to create table %q: %s", b.cfg.MetaRecordTableName, err)
+					return err
+				}
+			} else {
+				log.Infof("bigtable-idx: table %s exists.", b.cfg.MetaRecordTableName)
+				// table exists.  Lets make sure that it has all of the CF's we need.
+				table, err := adminClient.TableInfo(ctx, b.cfg.MetaRecordTableName)
+				if err != nil {
+					log.Errorf("bigtable-idx: failed to get tableInfo of %q: %s", b.cfg.MetaRecordTableName, err)
+					return err
+				}
+				existingFamilies := make(map[string]string)
+				for _, cf := range table.FamilyInfos {
+					existingFamilies[cf.Name] = cf.GCPolicy
+				}
+				policy, ok := existingFamilies[META_RECORD_COLUMN_FAMILY]
+				if !ok {
+					log.Infof("bigtable-idx: column family %s/%s does not exist. Creating it.", b.cfg.MetaRecordTableName, META_RECORD_COLUMN_FAMILY)
+					err = adminClient.CreateColumnFamily(ctx, b.cfg.MetaRecordTableName, META_RECORD_COLUMN_FAMILY)
+					if err != nil {
+						log.Errorf("bigtable-idx: failed to create cf %s/%s: %s", b.cfg.MetaRecordTableName, META_RECORD_COLUMN_FAMILY, err)
+						return err
+					}
+					err = adminClient.SetGCPolicy(ctx, b.cfg.MetaRecordTableName, META_RECORD_COLUMN_FAMILY, bigtable.MaxVersionsPolicy(1))
+					if err != nil {
+						log.Errorf("bigtable-idx: failed to set GCPolicy of %s/%s: %s", b.cfg.MetaRecordTableName, META_RECORD_COLUMN_FAMILY, err)
+						return err
+					}
+				} else if policy == "" {
+					log.Infof("bigtable-idx: column family %s/%s exists but has no GCPolicy. Creating it.", b.cfg.MetaRecordTableName, META_RECORD_COLUMN_FAMILY)
+					err = adminClient.SetGCPolicy(ctx, b.cfg.MetaRecordTableName, META_RECORD_COLUMN_FAMILY, bigtable.MaxVersionsPolicy(1))
+					if err != nil {
+						log.Errorf("bigtable-idx: failed to set GCPolicy of %s/%s: %s", b.cfg.MetaRecordTableName, META_RECORD_COLUMN_FAMILY, err)
+						return err
+					}
 				}
 			}
 		}
@@ -320,6 +380,41 @@ func (b *BigtableIdx) rebuildIndex() {
 	}
 
 	log.Infof("bigtable-idx: Rebuilding Memory Index Complete. Imported %d. Took %s", num, time.Since(pre))
+}
+
+func (b *BigtableIdx) MetaTagRecordUpsert(orgId uint32, upsertRecord tagquery.MetaTagRecord) (tagquery.MetaTagRecord, bool, error) {
+	record, created, err := b.MemoryIndex.MetaTagRecordUpsert(orgId, upsertRecord)
+	if err != nil {
+		return record, created, err
+	}
+
+	// TODO figure out how to determine which of the MT instances with updateCassIdx == true should flush a given record,
+	// currently they'll all flush it
+	if b.cfg.UpdateBigtableIdx {
+		var err error
+
+		// if a record has no meta tags associated with it, then we delete it
+		if len(record.MetaTags) > 0 {
+			err = b.persistMetaRecord(orgId, record, created)
+		} else {
+			err = b.deleteMetaRecord(orgId, record)
+		}
+
+		if err != nil {
+			log.Errorf("Failed to update meta records in cassandra: %s", err)
+			return record, created, fmt.Errorf("Failed to update cassandra: %s", err)
+		}
+	}
+
+	return record, created, nil
+}
+
+func (b *BigtableIdx) persistMetaRecord(orgId uint32, record tagquery.MetaTagRecord, created bool) error {
+	return nil
+}
+
+func (b *BigtableIdx) deleteMetaRecord(orgId uint32, record tagquery.MetaTagRecord) error {
+	return nil
 }
 
 func (b *BigtableIdx) LoadPartition(partition int32, defs []schema.MetricDefinition, now time.Time) []schema.MetricDefinition {
