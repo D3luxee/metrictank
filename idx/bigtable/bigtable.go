@@ -438,7 +438,7 @@ func (b *BigtableIdx) loadMetaRecords() map[uint32][]tagquery.MetaTagRecord {
 			MetaTags:    metaTags,
 		}
 
-		_, _, err = b.MemoryIndex.MetaTagRecordUpsert(orgId, record)
+		_, _, err = b.MemoryIndex.MetaTagRecordUpsert(orgId, record, false)
 		if err != nil {
 			log.Errorf("Failed to upsert meta record loaded from bigtable: %s", err)
 			return false
@@ -449,15 +449,13 @@ func (b *BigtableIdx) loadMetaRecords() map[uint32][]tagquery.MetaTagRecord {
 	return nil
 }
 
-func (b *BigtableIdx) MetaTagRecordUpsert(orgId uint32, upsertRecord tagquery.MetaTagRecord) (tagquery.MetaTagRecord, bool, error) {
-	record, created, err := b.MemoryIndex.MetaTagRecordUpsert(orgId, upsertRecord)
+func (b *BigtableIdx) MetaTagRecordUpsert(orgId uint32, upsertRecord tagquery.MetaTagRecord, persist bool) (tagquery.MetaTagRecord, bool, error) {
+	record, created, err := b.MemoryIndex.MetaTagRecordUpsert(orgId, upsertRecord, persist)
 	if err != nil {
 		return record, created, err
 	}
 
-	// TODO figure out how to determine which of the MT instances with updateCassIdx == true should flush a given record,
-	// currently they'll all flush it
-	if b.cfg.UpdateBigtableIdx {
+	if b.cfg.UpdateBigtableIdx && persist {
 		var err error
 
 		// if a record has no meta tags associated with it, then we delete it
